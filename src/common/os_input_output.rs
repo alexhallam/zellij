@@ -6,6 +6,7 @@ use nix::sys::termios;
 use nix::sys::wait::waitpid;
 use nix::unistd::{self, ForkResult, Pid};
 use serde::Serialize;
+use serde_cbor::{de::IoRead, Deserializer};
 use signal_hook::{consts::signal::*, iterator::Signals};
 use std::env;
 use std::io;
@@ -180,7 +181,7 @@ impl<T: Serialize> IpcSenderWithContext<T> {
     fn send(&mut self, msg: T) -> Result<(), std::io::Error> {
         let err_ctx = get_current_ctx();
         self.sender
-            .write_all(&bincode::serialize(&(msg, err_ctx)).unwrap())?;
+            .write_all(&serde_cbor::to_vec(&(msg, err_ctx)).unwrap())?;
         self.sender.flush()
     }
 }
@@ -188,8 +189,9 @@ impl<T: Serialize> IpcSenderWithContext<T> {
 #[derive(Clone)]
 pub struct ServerOsInputOutput {
     orig_termios: Arc<Mutex<termios::Termios>>,
-    recv_socket: Option<Arc<Mutex<io::BufReader<LocalSocketStream>>>>,
+    recv_socket: Option<Arc<Mutex<Deserializer<IoRead<io::BufReader<LocalSocketStream>>>>>>,
     sender_socket: Arc<Mutex<Option<IpcSenderWithContext<ClientInstruction>>>>,
+    recv_fd: RawFd,
 }
 
 /// The `ServerOsApi` trait represents an abstract interface to the features of an operating system that
@@ -254,16 +256,8 @@ impl ServerOsApi for ServerOsInputOutput {
         Ok(())
     }
     fn server_recv(&self) -> (ServerInstruction, ErrorContext) {
-        let mut buf = [0; IPC_BUFFER_SIZE];
-        let bytes = self
-            .recv_socket
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .read(&mut buf)
-            .unwrap();
-        bincode::deserialize(&buf[..bytes]).unwrap()
+        let mut deserializer = self.recv_socket.as_ref().unwrap().lock().unwrap();
+        serde::de::Deserialize::deserialize(&mut *deserializer).unwrap()
     }
     fn send_to_client(&self, msg: ClientInstruction) {
         self.sender_socket
@@ -276,20 +270,15 @@ impl ServerOsApi for ServerOsInputOutput {
     }
     fn add_client_sender(&mut self) {
         assert!(self.sender_socket.lock().unwrap().is_none());
-        let sock_fd = self
-            .recv_socket
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .get_ref()
-            .as_raw_fd();
-        let dup_fd = unistd::dup(sock_fd).unwrap();
+        let dup_fd = unistd::dup(self.recv_fd).unwrap();
         let dup_sock = unsafe { LocalSocketStream::from_raw_fd(dup_fd) };
         *self.sender_socket.lock().unwrap() = Some(IpcSenderWithContext::new(dup_sock));
     }
     fn update_receiver(&mut self, stream: LocalSocketStream) {
-        self.recv_socket = Some(Arc::new(Mutex::new(io::BufReader::new(stream))));
+        self.recv_fd = stream.as_raw_fd();
+        self.recv_socket = Some(Arc::new(Mutex::new(Deserializer::from_reader(
+            io::BufReader::new(stream),
+        ))));
     }
 }
 
@@ -305,6 +294,7 @@ pub fn get_server_os_input() -> ServerOsInputOutput {
     ServerOsInputOutput {
         orig_termios,
         recv_socket: None,
+        recv_fd: 0,
         sender_socket: Arc::new(Mutex::new(None)),
     }
 }
@@ -313,7 +303,7 @@ pub fn get_server_os_input() -> ServerOsInputOutput {
 pub struct ClientOsInputOutput {
     orig_termios: Arc<Mutex<termios::Termios>>,
     server_sender: Arc<Mutex<Option<IpcSenderWithContext<ServerInstruction>>>>,
-    receiver: Arc<Mutex<Option<io::BufReader<LocalSocketStream>>>>,
+    receiver: Arc<Mutex<Option<Deserializer<IoRead<io::BufReader<LocalSocketStream>>>>>>,
 }
 
 /// The `ClientOsApi` trait represents an abstract interface to the features of an operating system that
@@ -380,16 +370,9 @@ impl ClientOsApi for ClientOsInputOutput {
             .unwrap();
     }
     fn client_recv(&self) -> (ClientInstruction, ErrorContext) {
-        let mut buf = [0; IPC_BUFFER_SIZE];
-        let bytes = self
-            .receiver
-            .lock()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .read(&mut buf)
-            .unwrap();
-        bincode::deserialize(&buf[..bytes]).unwrap()
+        let mut lock = self.receiver.lock().unwrap();
+        let deserializer = lock.as_mut().unwrap();
+        serde::de::Deserialize::deserialize(&mut *deserializer).unwrap()
     }
     fn receive_sigwinch(&self, cb: Box<dyn Fn()>) {
         let mut signals = Signals::new(&[SIGWINCH, SIGTERM, SIGINT, SIGQUIT]).unwrap();
@@ -418,7 +401,8 @@ impl ClientOsApi for ClientOsInputOutput {
         let receiver = unsafe { LocalSocketStream::from_raw_fd(dup_fd) };
         let sender = IpcSenderWithContext::new(socket);
         *self.server_sender.lock().unwrap() = Some(sender);
-        *self.receiver.lock().unwrap() = Some(io::BufReader::new(receiver));
+        *self.receiver.lock().unwrap() =
+            Some(Deserializer::from_reader(io::BufReader::new(receiver)));
     }
 }
 
